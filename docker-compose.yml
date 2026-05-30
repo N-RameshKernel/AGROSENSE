@@ -1,0 +1,183 @@
+version: "3.9"
+
+services:
+  # ─────────────────────────── Infrastructure ───────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: agrosense_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: agrosense
+      POSTGRES_PASSWORD: agrosense
+      POSTGRES_DB: agrosense
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agrosense"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: agrosense_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.12.1
+    container_name: agrosense_mlflow
+    restart: unless-stopped
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri postgresql://agrosense:agrosense@postgres:5432/agrosense
+      --default-artifact-root /mlflow/artifacts
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ─────────────────────────── Backend ───────────────────────────────────
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: agrosense_backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://agrosense:agrosense@postgres:5432/agrosense
+      REDIS_URL: redis://redis:6379
+      LLM_SERVER_URL: http://inference:8080
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      JWT_SECRET: ${JWT_SECRET:-supersecretchangeme}
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ─────────────────────────── Celery Worker ─────────────────────────────
+
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: agrosense_celery
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://agrosense:agrosense@postgres:5432/agrosense
+      REDIS_URL: redis://redis:6379
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./backend:/app
+      - model_store:/models
+    command: celery -A celery_app worker --loglevel=info --concurrency=2 -Q llmops
+
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: agrosense_celery_beat
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://redis:6379
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    depends_on:
+      - redis
+    volumes:
+      - ./backend:/app
+    command: celery -A celery_app beat --loglevel=info
+
+  # ─────────────────────────── LLM Inference (GPU) ───────────────────────
+
+  inference:
+    image: vllm/vllm-openai:latest
+    container_name: agrosense_inference
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - model_store:/models
+    ports:
+      - "8080:8080"
+    command: >
+      --model /models/agrosense-v1.2
+      --host 0.0.0.0
+      --port 8080
+      --max-model-len 2048
+      --dtype float16
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles:
+      - gpu
+
+  # ─────────────────────────── LLM Inference (CPU) ───────────────────────
+  # Fix: Ollama listens on 11434 internally; map host 8080 → container 11434
+  # so both inference services expose the same host port 8080.
+  inference_cpu:
+    image: ollama/ollama:latest
+    container_name: agrosense_inference_cpu
+    restart: unless-stopped
+    ports:
+      - "8080:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    profiles:
+      - cpu
+
+  # ─────────────────────────── Frontend ──────────────────────────────────
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: http://localhost:8000
+    container_name: agrosense_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  mlflow_artifacts:
+  model_store:
+  ollama_data:
